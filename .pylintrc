@@ -1,0 +1,4 @@
+[MESSAGES CONTROL]
+# Handlers and small helpers are named for what they do; docstrings are kept
+# for the non-obvious ones (decisions, invariants), not required everywhere.
+disable=missing-function-docstring,C0115
