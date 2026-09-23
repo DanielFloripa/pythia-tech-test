@@ -1,26 +1,20 @@
 """
-In-memory JobStore.
+Job state, in memory.
 
-Architectural note (why this file looks the way it does):
-The segment pool is a ThreadPoolExecutor (see worker/pool.py) — the fit
-steps are blocking calls that wait on pythia_library's own internal
-subprocess pool, which releases the GIL while waiting, so threads are
-sufficient at our layer (see worker/pool.py docstring for the full
-reasoning). This means worker code runs in the *same* process and *same*
-memory space as this store — no IPC needed to get updates back.
+Segments run on threads in this same process (see worker/pool.py), so a
+worker writes progress straight into this dict instead of shipping it back
+over IPC. That is the whole reason per-stage progress is cheap here. The
+lock is the ordinary price: several pool threads write concurrently, and the
+API reads while they do.
 
-Consequence: pipeline.py can call store.update_segment(...) directly, from
-whichever thread is executing that segment, at every stage transition —
-current_stage can reflect real-time progress accurately, not just the
-terminal outcome. The threading.Lock below exists for the ordinary reason a
-shared mutable dict needs one: multiple pool threads updating different (or
-the same) job concurrently.
+Everything the rest of the app needs is in these four methods, which is the
+seam to swap for Redis or Postgres when one process stops being enough.
 """
 
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 from uuid import UUID, uuid4
@@ -58,11 +52,6 @@ class Job:
 
 
 class JobStore:
-    """Thread-safe in-memory store. Swap point for Postgres/Redis later —
-    every method here is the interface the rest of the app depends on, so a
-    persistent implementation only needs to satisfy the same signatures.
-    """
-
     def __init__(self) -> None:
         self._jobs: Dict[UUID, Job] = {}
         # dedup_key -> job_id, only for jobs that are NOT terminal yet.
@@ -71,16 +60,38 @@ class JobStore:
         self._active_by_dedup_key: Dict[str, UUID] = {}
         self._lock = threading.Lock()
 
-    def find_active_by_dedup_key(self, dedup_key: str) -> Optional[Job]:
-        with self._lock:
-            job_id = self._active_by_dedup_key.get(dedup_key)
-            return self._jobs[job_id] if job_id else None
+    @staticmethod
+    def _snapshot(job: Job) -> Job:
+        """Point-in-time copy. Call it with the lock held; a copy taken
+        outside the lock is as torn as the original. Shallow is enough
+        because SegmentResult objects get replaced, never edited.
+        """
+        return replace(job, segments=dict(job.segments))
 
-    def create_job(
+    def get_or_create_job(
         self, request: PredictionRequest, dedup_key: str, segment_keys: List[SegmentKey]
+    ) -> Tuple[Job, bool]:
+        """Check and insert under one lock acquisition, returning
+        (job, created). Two separate calls would let two identical
+        submissions both see "nothing active" and both create a job.
+        """
+        # Built outside the lock: only check+insert has to be atomic. Costs a
+        # throwaway object whenever the request turns out to be a duplicate.
+        candidate = self._new_job(request, dedup_key, segment_keys)
+        with self._lock:
+            existing_id = self._active_by_dedup_key.get(dedup_key)
+            if existing_id is not None:
+                return self._snapshot(self._jobs[existing_id]), False
+            self._jobs[candidate.job_id] = candidate
+            self._active_by_dedup_key[dedup_key] = candidate.job_id
+            return self._snapshot(candidate), True
+
+    @staticmethod
+    def _new_job(
+        request: PredictionRequest, dedup_key: str, segment_keys: List[SegmentKey]
     ) -> Job:
         now = datetime.now(timezone.utc)
-        job = Job(
+        return Job(
             job_id=uuid4(),
             dedup_key=dedup_key,
             request=request,
@@ -96,26 +107,32 @@ class JobStore:
             created_at=now,
             updated_at=now,
         )
-        with self._lock:
-            self._jobs[job.job_id] = job
-            self._active_by_dedup_key[dedup_key] = job.job_id
-        return job
 
     def get_job(self, job_id: UUID) -> Optional[Job]:
+        """A snapshot, never the live Job: a response reads status, counters
+        and the segment list, and those have to agree with each other.
+        """
         with self._lock:
-            return self._jobs.get(job_id)
+            job = self._jobs.get(job_id)
+            return self._snapshot(job) if job is not None else None
 
-    def update_segment(self, job_id: UUID, segment_key: SegmentKey, updated: SegmentResult) -> None:
-        """Replace one segment's state. Called directly from whichever pool
-        thread is executing that segment — see the module docstring.
+    def update_segment(self, job_id: UUID, segment_key: SegmentKey, updated: SegmentResult) -> bool:
+        """Replace one segment's state, from the thread running it.
+
+        True means this write is the one that finished the job. The caller
+        reacts to that outside the lock; logging is I/O and the lock must
+        never wait on I/O.
         """
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
-                return  # defensive: job was never created or was purged
+                return False  # defensive: job was never created or was purged
+            was_terminal = job.is_terminal()
             job.segments[segment_key] = updated
             job.updated_at = datetime.now(timezone.utc)
             if job.is_terminal():
-                # free the dedup slot so a future identical request doesn't
-                # get silently merged into this already-finished job
+                # Drop the dedup slot: a later identical request deserves a
+                # fresh job, not a merge into this finished one.
                 self._active_by_dedup_key.pop(job.dedup_key, None)
+                return not was_terminal
+            return False

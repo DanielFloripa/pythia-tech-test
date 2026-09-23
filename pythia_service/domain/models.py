@@ -1,33 +1,29 @@
 """
-Pydantic contract for the Pythia prediction service.
+Wire contract for the prediction service.
 
-Design decisions reflected here (ver design-doc.md):
-- Segment state is granular per pipeline stage, not binary success/failed —
-  gives the caller visibility into *what* is happening / *where* it failed.
-- Job-level status is derived from segment states, never set independently
-  (avoids drift between job.status and segments[*].status).
+Two things worth knowing before reading: segment state is per stage rather
+than a success/failed flag, so a caller can see where a job actually is, and
+job status is never stored, only derived (see jobs/state.py).
 """
 
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from enum import Enum
-from typing import List, Optional
+from itertools import product
+from typing import List, Optional, Tuple
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+# 8x today's catalog. Caps the worst case at roughly 14 min of machine time.
+# The right number is a product call, hence the env var.
+MAX_SEGMENTS_PER_REQUEST = int(os.environ.get("PYTHIA_MAX_SEGMENTS", "64"))
 
-# ---------------------------------------------------------------------------
-# Enums
-# ---------------------------------------------------------------------------
 
 class PipelineStage(str, Enum):
-    """One stage of the per-segment pipeline, in execution order.
-
-    Used both to report progress (segment.current_stage while running) and
-    to report where a failure happened (segment.failed_stage).
-    """
+    """The seven steps of one segment, in execution order."""
     FETCHING_PLAYERS = "fetching_players"
     FETCHING_REVENUES = "fetching_revenues"
     FETCHING_GAMEROUNDS = "fetching_gamerounds"
@@ -52,10 +48,6 @@ class JobStatus(str, Enum):
     FAILED = "failed"                   # all segments failed
 
 
-# ---------------------------------------------------------------------------
-# Request
-# ---------------------------------------------------------------------------
-
 class PredictionRequest(BaseModel):
     games: List[str] = Field(..., min_length=1, description="Game IDs to predict for")
     regions: List[str] = Field(..., min_length=1, description="Regions to predict for")
@@ -67,14 +59,23 @@ class PredictionRequest(BaseModel):
         cleaned = [s.strip() for s in v]
         if any(not s for s in cleaned):
             raise ValueError("empty values are not allowed")
-        # de-dupe preserving order — also stabilizes the dedup-key hash downstream
-        seen = dict.fromkeys(cleaned)
-        return list(seen)
+        return list(dict.fromkeys(cleaned))  # de-dupe, keep order
 
+    @model_validator(mode="after")
+    def _bounded_fan_out(self) -> PredictionRequest:
+        # A cartesian product: 50x50x50 strings is 125k segments, weeks of
+        # compute, and the pool is FIFO. Bounds one request, not total load.
+        count = len(self.games) * len(self.regions) * len(self.platforms)
+        if count > MAX_SEGMENTS_PER_REQUEST:
+            raise ValueError(
+                f"request expands to {count} segments; the limit is {MAX_SEGMENTS_PER_REQUEST}"
+            )
+        return self
 
-# ---------------------------------------------------------------------------
-# Response — segment level
-# ---------------------------------------------------------------------------
+    def segment_keys(self) -> List[Tuple[str, str, str]]:
+        """One (game, region, platform) tuple per segment, stable order."""
+        return list(product(self.games, self.regions, self.platforms))
+
 
 class SegmentPrediction(BaseModel):
     """Populated only when status == SUCCESS."""
@@ -83,6 +84,12 @@ class SegmentPrediction(BaseModel):
 
 
 class SegmentResult(BaseModel):
+    """Frozen: the store swaps these objects, it never edits one in place.
+    That is what makes the store's shallow snapshot a consistent read, so the
+    invariant is enforced here rather than left to discipline.
+    """
+    model_config = ConfigDict(frozen=True)
+
     game: str
     region: str
     platform: str
@@ -105,10 +112,6 @@ class SegmentResult(BaseModel):
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
 
-
-# ---------------------------------------------------------------------------
-# Response — job level
-# ---------------------------------------------------------------------------
 
 class JobSubmitResponse(BaseModel):
     job_id: UUID

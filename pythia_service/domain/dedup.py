@@ -1,10 +1,9 @@
 """
-Dedup key: identifica submissões equivalentes de (games, regions, platforms)
-para que uma segunda submissão idêntica, enquanto a primeira ainda está
-in-flight, reaproveite o mesmo job em vez de reprocessar os mesmos segmentos.
+Identity of a submission, so an identical one arriving while the first is
+still running can join it instead of recomputing the same segments.
 
-Fica em domain/ (não em jobs/) porque é uma regra de negócio pura — não
-depende de como o job é armazenado ou executado, só do request.
+Lives in domain/ rather than jobs/ because it depends on the request alone,
+not on how jobs are stored or executed.
 """
 
 from __future__ import annotations
@@ -15,19 +14,14 @@ from pythia_service.domain.models import PredictionRequest
 
 
 def compute_dedup_key(request: PredictionRequest) -> str:
-    """Hash determinístico e estável de (games, regions, platforms).
+    """Stable hash of (games, regions, platforms), order-independent.
 
-    Determinístico = mesma entrada semântica sempre gera a mesma key,
-    independente da ordem em que o cliente enviou as listas.
-
-    Requer que PredictionRequest já tenha normalizado as listas
-    (strip + de-dupe, feito no validator do model) — aqui só ordenamos,
-    não limpamos dados de novo.
+    Assumes PredictionRequest already stripped and de-duped the lists, so
+    sorting is all that is left to do here.
     """
-    parts = (
+    canonical = repr((
         sorted(request.games),
         sorted(request.regions),
-        sorted(request.platforms),
-    )
-    canonical = repr(parts).encode("utf-8")
-    return hashlib.sha256(canonical).hexdigest()
+        sorted(request.platforms)
+    ))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

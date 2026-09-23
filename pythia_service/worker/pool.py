@@ -1,53 +1,35 @@
 """
-Shared segment-execution pool.
+Where segments actually run.
 
-Revised decision (see conversation): originally planned as a
-ProcessPoolExecutor, on the assumption that the fit steps were CPU-bound
-inside *our* process and needed real processes to bypass the GIL.
+Threads, not processes, and that is not the obvious choice. pythia_library's
+fit functions open their own multiprocessing.Pool, so the CPU work already
+happens in child processes; from here a fit is a blocking wait, which frees
+the GIL exactly like I/O does. Putting this in a ProcessPoolExecutor would
+also break outright: multiprocessing workers are daemonic and daemonic
+processes cannot have children.
 
-That assumption was wrong for this library. The README states the modeling
-functions "each spawn an internal process pool" — the CPU-heavy work already
-happens in subprocesses managed by pythia_library itself. From our process's
-point of view, calling fit_player_data(...) is a *blocking call that waits on
-its own subprocesses*, which releases the GIL exactly like blocking I/O does.
-
-Two consequences:
-1. A ProcessPoolExecutor here would be actively wrong, not just suboptimal —
-   worker processes created by multiprocessing are daemonic by default, and
-   daemonic processes cannot spawn children. Calling fit_player_data from
-   inside one would raise AssertionError at runtime.
-2. A ThreadPoolExecutor is sufficient for our layer: segment concurrency is
-   about overlapping blocking waits (I/O fetch + waiting on the library's own
-   subprocess pool), not about doing CPU work ourselves.
-
-The real resource constraint doesn't disappear, it just moves: each segment
-running through the library uses up to 4 cores internally. If we let S
-segments run concurrently, actual CPU usage is S * 4 cores. So pool size is
-still the admission-control lever (same intent as the original decision,
-different mechanism) — sized so that S * 4 doesn't exceed the machine's cores.
+The CPU limit does not disappear, it moves. Each segment burns up to 4 cores
+inside the library, so the number of concurrent segments is the only knob we
+have over machine load.
 """
 
 import os
 from concurrent.futures import ThreadPoolExecutor
 
-CORES_PER_SEGMENT = 4  # fixed cost stated in the README for the fit steps
+CORES_PER_SEGMENT = 4  # num_cpus the library passes to each fit
 
 
 def compute_pool_size(available_cores: int | None = None) -> int:
-    """Max number of segments allowed to run concurrently.
-
-    Floor of 1: even on a machine with fewer than 4 cores, we still want to
-    process segments one at a time rather than refuse to start.
-    """
+    """How many segments may run at once. Floor of 1, so a 2-core box still
+    works, one segment at a time."""
     cores = available_cores if available_cores is not None else (os.cpu_count() or CORES_PER_SEGMENT)
     return max(1, cores // CORES_PER_SEGMENT)
 
 
 class SegmentPool:
-    """Thin wrapper around ThreadPoolExecutor with explicit lifecycle
-    (create once at app startup, shut down once at app shutdown) instead of
-    a module-level global — makes ownership explicit and testable, and
-    avoids a pool silently surviving across app reloads in dev.
+    """ThreadPoolExecutor with an explicit lifecycle. A module-level global
+    would start a pool on import and survive reloads in dev; here the app
+    owns it and tests can build their own.
     """
 
     def __init__(self, max_workers: int | None = None) -> None:
@@ -60,16 +42,20 @@ class SegmentPool:
 
     def start(self) -> None:
         if self._executor is not None:
-            return  # idempotent: calling start() twice is a no-op, not an error
+            return  # start() twice is a no-op, not an error
         self._executor = ThreadPoolExecutor(
             max_workers=self._max_workers, thread_name_prefix="pythia-segment"
         )
 
-    def shutdown(self, wait: bool = True) -> None:
+    def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:
         if self._executor is None:
             return
-        self._executor.shutdown(wait=wait)
+        self._executor.shutdown(wait=wait, cancel_futures=cancel_futures)
         self._executor = None
+
+    @property
+    def is_running(self) -> bool:
+        return self._executor is not None
 
     @property
     def executor(self) -> ThreadPoolExecutor:
