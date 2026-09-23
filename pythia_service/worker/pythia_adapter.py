@@ -1,17 +1,10 @@
 """
-Single point of contact with pythia_library_v1.
+The only module that imports pythia_library. Switching the service to v2 is
+an edit to the two imports below and nothing else.
 
-Nothing outside this file should `import pythia_library_v1` directly. If a
-production deployment ever needs to switch to pythia_library_v2, this is the
-one file that changes — everything else (worker/pipeline.py, the API layer)
-depends only on the functions defined here.
-
-Kept intentionally thin: no error handling, no retries, no store updates.
-Each function does exactly one pipeline stage and lets the library's own
-exceptions (e.g. KeyError from query_data on an unconfigured segment)
-propagate as-is. worker/pipeline.py is responsible for catching per-stage
-and recording which PipelineStage failed — that's an orchestration concern,
-not an adapter concern.
+No error handling or retries here on purpose: one function per pipeline
+stage, library exceptions left to propagate. Deciding what a failure means
+belongs to pipeline.py.
 """
 
 import pandas as pd
@@ -19,13 +12,12 @@ from numpy.typing import NDArray
 
 from pythia_library_v1 import bigquery, modeling
 
-DEFAULT_NUM_CPUS = 4  # matches the library's own default and the README's cost table
+DEFAULT_NUM_CPUS = 4  # the library's own default
 
 
 def fetch_players(game: str, region: str, platform: str) -> pd.Series:
-    """~5s. Returns the 'players' column only — query_data's DataFrame also
-    carries dt/game/region/platform columns that fit_player_data doesn't
-    take (it wants a bare Series, per its docstring).
+    """~5s. Only the KPI column: the fits take a bare Series, and query_data
+    returns it alongside dt/game/region/platform.
     """
     df = bigquery.query_data("players", game, region, platform)
     return df["players"]
@@ -44,7 +36,7 @@ def fetch_gamerounds(game: str, region: str, platform: str) -> pd.Series:
 
 
 def fit_players(players_data: pd.Series, num_cpus: int = DEFAULT_NUM_CPUS) -> NDArray:
-    """~5s, CPU-bound inside the library (blocking from our side)."""
+    """~5s. CPU-bound in the library's child processes, a blocking wait here."""
     return modeling.fit_player_data(players_data, num_cpus=num_cpus)
 
 
@@ -58,12 +50,10 @@ def fit_economy(
 def fit_gamerounds(
     gamerounds_data: pd.Series, modeled_economy: NDArray, num_cpus: int = DEFAULT_NUM_CPUS
 ) -> NDArray:
-    """~4s. Depends on fit_economy's output.
+    """~4s. Takes fit_economy's output.
 
-    Note: the library's own parameter name for this is `modeled_revenues`,
-    which is misleading — it's actually the output of fit_economy_data, not
-    raw revenue data. Named `modeled_economy` here to match what it is, not
-    what the library calls it (library itself is not ours to rename).
+    The library calls this parameter `modeled_revenues`, which reads like raw
+    revenue data. It is not, so the name here says what it holds.
     """
     return modeling.fit_gameround_data(gamerounds_data, modeled_economy, num_cpus=num_cpus)
 
@@ -74,9 +64,7 @@ def run_prediction(
     modeled_gamerounds: NDArray,
     num_cpus: int = DEFAULT_NUM_CPUS,
 ) -> NDArray:
-    """~3s. Named run_prediction, not predict, to avoid shadowing the
-    stdlib-adjacent builtin-sounding name and to keep call sites readable
-    (`pythia_adapter.run_prediction(...)` reads clearer than a bare
-    `predict(...)` re-export would).
+    """~3s. Called run_prediction so call sites read as an action rather
+    than a re-exported `predict`.
     """
     return modeling.predict(modeled_players, modeled_economy, modeled_gamerounds, num_cpus=num_cpus)

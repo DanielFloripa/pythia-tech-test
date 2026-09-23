@@ -1,21 +1,20 @@
 """
-Segment pipeline: the function submitted to SegmentPool for each
-(game, region, platform). One call here = one segment, start to finish.
+One segment, start to finish. This is what gets submitted to the pool.
 
-Scope note: this implements the v1 pipeline (Part 1 of the challenge —
-the HTTP backend). It is sequential per-KPI within a segment, matching
-scripts/pythia-prediction-v1.py's pythia_oracle. Concurrency happens across
-segments (via SegmentPool's thread pool), not within one. The I/O-overlap
-optimization described in Part 2 of the README is a separate, standalone
-script (scripts/pythia-prediction-v2-optimized.py) that the README does not
-ask to be wired into the backend — so it isn't, here.
+Inside a segment the seven steps are strictly sequential, same as the DS
+script; parallelism lives between segments. The in-segment I/O overlap from
+Part 2 of the README stays in its own script, since the README never asks
+for it in the backend.
 
-Because the pool is a ThreadPoolExecutor (see worker/pool.py), this function
-runs in the same process and memory space as the JobStore, so it updates
-segment state directly and granularly — current_stage before each call,
-so a GET mid-flight reflects real progress, not just the final outcome.
+State is written before each step rather than only at the end, which is
+affordable because the store is in the same process. A poll landing mid-run
+shows the stage the segment is in.
+
+On logs: INFO covers the lifecycle, DEBUG every stage transition, and
+queued_s on segment_started is the backpressure number worth watching.
 """
 
+import time
 from datetime import datetime, timezone
 from uuid import UUID
 
@@ -26,23 +25,34 @@ from pythia_service.domain.models import (
     SegmentStatus,
 )
 from pythia_service.jobs.store import JobStore, SegmentKey
+from pythia_service.logging_setup import get_logger, kv
 from pythia_service.worker import pythia_adapter
 
+logger = get_logger("pipeline")
 
-def process_segment(store: JobStore, job_id: UUID, segment_key: SegmentKey) -> None:
-    """Run one segment's full pipeline and write every state transition to
-    the store. Never raises — any failure from the adapter is caught here
-    and turned into a FAILED SegmentResult, because this function runs
-    inside a pool thread with no caller waiting on its return value
-    (submitted via executor.submit, not awaited inline); an uncaught
-    exception here would only surface silently in the Future object and
-    never reach the store, leaving the segment stuck at its last state
-    forever.
+
+def process_segment(
+    store: JobStore, job_id: UUID, segment_key: SegmentKey, enqueued_at: float | None = None
+) -> None:
+    """Runs the segment and records every transition. Never raises.
+
+    Nobody calls .result() on these futures, so an exception escaping here
+    would sit inside a Future that nobody reads, and the segment would look
+    RUNNING forever. Catching it and writing FAILED is what makes the
+    failure visible at all.
+
+    enqueued_at is a time.monotonic() stamp from submit time, only used to
+    report queue wait.
     """
     game, region, platform = segment_key
+    segment = f"{game}/{region}/{platform}"
     started_at = datetime.now(timezone.utc)
+    t0 = time.monotonic()
+    queued_s = round(t0 - enqueued_at, 1) if enqueued_at is not None else None
+    logger.info(kv("segment_started", job_id=job_id, segment=segment, queued_s=queued_s))
 
     def set_stage(stage: PipelineStage) -> None:
+        logger.debug(kv("segment_stage", job_id=job_id, segment=segment, stage=stage))
         store.update_segment(
             job_id,
             segment_key,
@@ -78,7 +88,13 @@ def process_segment(store: JobStore, job_id: UUID, segment_key: SegmentKey) -> N
         set_stage(PipelineStage.PREDICTING)
         prediction = pythia_adapter.run_prediction(modeled_players, modeled_economy, modeled_gamerounds)
 
-        store.update_segment(
+        result = SegmentPrediction(sum=float(prediction.sum()), mean=float(prediction.mean()))
+        logger.info(kv(
+            "segment_succeeded", job_id=job_id, segment=segment,
+            duration_s=round(time.monotonic() - t0, 1), sum=result.sum, mean=result.mean,
+        ))
+        _record(
+            store,
             job_id,
             segment_key,
             SegmentResult(
@@ -86,19 +102,26 @@ def process_segment(store: JobStore, job_id: UUID, segment_key: SegmentKey) -> N
                 region=region,
                 platform=platform,
                 status=SegmentStatus.SUCCESS,
-                prediction=SegmentPrediction(sum=float(prediction.sum()), mean=float(prediction.mean())),
+                prediction=result,
                 started_at=started_at,
                 finished_at=datetime.now(timezone.utc),
             ),
         )
 
-    except Exception as exc:  # noqa: BLE001 — intentionally broad, see docstring
-        # current_stage of the in-flight SegmentResult tells us where we were
-        # when it broke; re-derive it from what we last set rather than
-        # threading a "current stage" variable through the try block twice.
+    except Exception as exc:  # noqa: BLE001 - broad on purpose, see docstring
+        # Where were we? The stage we last wrote to the store, rather than a
+        # second variable tracked in parallel through the try block.
         current = store.get_job(job_id)
         failed_stage = current.segments[segment_key].current_stage if current else None
-        store.update_segment(
+        error = _describe(exc)
+        # The API says what failed; only the traceback says why.
+        logger.error(
+            kv("segment_failed", job_id=job_id, segment=segment, stage=failed_stage,
+               duration_s=round(time.monotonic() - t0, 1), error=error),
+            exc_info=True,
+        )
+        _record(
+            store,
             job_id,
             segment_key,
             SegmentResult(
@@ -107,7 +130,7 @@ def process_segment(store: JobStore, job_id: UUID, segment_key: SegmentKey) -> N
                 platform=platform,
                 status=SegmentStatus.FAILED,
                 failed_stage=failed_stage,
-                error_message=str(exc),
+                error_message=error,
                 started_at=started_at,
                 finished_at=datetime.now(timezone.utc),
             ),
@@ -115,9 +138,61 @@ def process_segment(store: JobStore, job_id: UUID, segment_key: SegmentKey) -> N
 
 
 def submit_job_segments(store: JobStore, pool_executor, job_id: UUID, segment_keys: list[SegmentKey]) -> None:
-    """Enqueue every segment of a job onto the shared pool. Fire-and-forget
-    from the caller's point of view — the API returns immediately after
-    this; segment completion is only ever observed via GET /predictions/{id}.
+    """Enqueue a job's segments. Fire and forget: the API responds right
+    after this, and progress is only ever seen through GET.
     """
-    for segment_key in segment_keys:
-        pool_executor.submit(process_segment, store, job_id, segment_key)
+    for i, segment_key in enumerate(segment_keys):
+        try:
+            pool_executor.submit(process_segment, store, job_id, segment_key, time.monotonic())
+        except RuntimeError:
+            # Pool went down mid-loop. Leaving the rest PENDING would strand
+            # the job forever and, worse, keep its dedup key occupied, so
+            # every identical request afterwards would join a dead job.
+            # Deleting the job is not an option either: a deduplicated caller
+            # may already hold this id, and their next GET would 404.
+            logger.warning(kv(
+                "job_schedule_failed", job_id=job_id, scheduled=i, unscheduled=len(segment_keys) - i,
+            ))
+            _fail_unscheduled(store, job_id, segment_keys[i:])
+            raise
+
+
+def _fail_unscheduled(store: JobStore, job_id: UUID, segment_keys: list[SegmentKey]) -> None:
+    now = datetime.now(timezone.utc)
+    for game, region, platform in segment_keys:
+        _record(
+            store,
+            job_id,
+            (game, region, platform),
+            SegmentResult(
+                game=game,
+                region=region,
+                platform=platform,
+                status=SegmentStatus.FAILED,
+                error_message="not scheduled: service shutting down",
+                finished_at=now,
+            ),
+        )
+
+
+def _record(store: JobStore, job_id: UUID, segment_key: SegmentKey, result: SegmentResult) -> None:
+    """Write a terminal result; log the job outcome if this write closed it."""
+    if not store.update_segment(job_id, segment_key, result):
+        return
+    job = store.get_job(job_id)
+    if job is None:
+        return
+    segments = job.segments.values()
+    logger.info(kv(
+        "job_finished", job_id=job_id, status=job.status, segments=len(segments),
+        succeeded=sum(s.status == SegmentStatus.SUCCESS for s in segments),
+        failed=sum(s.status == SegmentStatus.FAILED for s in segments),
+        duration_s=round((job.updated_at - job.created_at).total_seconds(), 1),
+    ))
+
+
+def _describe(exc: Exception) -> str:
+    """Plain "KeyError: message". str() on a KeyError adds its own quotes."""
+    if len(exc.args) == 1 and isinstance(exc.args[0], str):
+        return f"{type(exc).__name__}: {exc.args[0]}"
+    return f"{type(exc).__name__}: {exc}"
