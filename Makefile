@@ -41,7 +41,7 @@ run-v1: ## DS reference script, library v1 -> results-v1.csv
 run-v2: ## Sequential baseline, library v2 -> results-v2.csv
 	$(VENV_PATH) ./run-v2.sh
 
-run-v2-optimized: ## Part 2 optimized script, library v2 (not implemented yet)
+run-v2-optimized: ## Part 2 optimized script, library v2
 	$(VENV_PATH) ./run-v2-optimized.sh
 
 clean: ## Remove caches and e2e artifacts

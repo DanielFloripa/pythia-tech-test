@@ -124,6 +124,31 @@ class JobSubmitResponse(BaseModel):
     created_at: datetime
 
 
+class JobSummary(BaseModel):
+    """A job without its segments, for listings."""
+    job_id: UUID
+    status: JobStatus
+    segment_count: int
+    segments_succeeded: int
+    segments_failed: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class JobListResponse(BaseModel):
+    jobs: List[JobSummary]
+    returned: int = Field(description="How many jobs this page holds, newest first")
+
+
+class StatsResponse(BaseModel):
+    """Queue depth and pool size: what "is it stuck or is it queued?" needs."""
+    pool_workers: int
+    jobs_total: int
+    jobs_active: int
+    segments_pending: int
+    segments_running: int
+
+
 class JobStatusResponse(BaseModel):
     job_id: UUID
     status: JobStatus

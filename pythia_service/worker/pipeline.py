@@ -15,7 +15,7 @@ queued_s on segment_started is the backpressure number worth watching.
 """
 
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from uuid import UUID
 
 from pythia_service.domain.models import (
@@ -46,7 +46,7 @@ def process_segment(
     """
     game, region, platform = segment_key
     segment = f"{game}/{region}/{platform}"
-    started_at = datetime.now(timezone.utc)
+    started_at = datetime.now(UTC)
     t0 = time.monotonic()
     queued_s = round(t0 - enqueued_at, 1) if enqueued_at is not None else None
     logger.info(kv("segment_started", job_id=job_id, segment=segment, queued_s=queued_s))
@@ -104,11 +104,11 @@ def process_segment(
                 status=SegmentStatus.SUCCESS,
                 prediction=result,
                 started_at=started_at,
-                finished_at=datetime.now(timezone.utc),
+                finished_at=datetime.now(UTC),
             ),
         )
 
-    except Exception as exc:  # noqa: BLE001 - broad on purpose, see docstring
+    except Exception as exc:
         # Where were we? The stage we last wrote to the store, rather than a
         # second variable tracked in parallel through the try block.
         current = store.get_job(job_id)
@@ -132,7 +132,7 @@ def process_segment(
                 failed_stage=failed_stage,
                 error_message=error,
                 started_at=started_at,
-                finished_at=datetime.now(timezone.utc),
+                finished_at=datetime.now(UTC),
             ),
         )
 
@@ -158,7 +158,7 @@ def submit_job_segments(store: JobStore, pool_executor, job_id: UUID, segment_ke
 
 
 def _fail_unscheduled(store: JobStore, job_id: UUID, segment_keys: list[SegmentKey]) -> None:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     for game, region, platform in segment_keys:
         _record(
             store,

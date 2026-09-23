@@ -59,6 +59,11 @@ later design, not to this one.
 | Request too large            | Rejected with 422 before anything is created. The cap is `PYTHIA_MAX_SEGMENTS` (64).                                                                                                   |
 | Process dies                 | Everything is lost: state is in memory. This is the first thing persistence buys.                                                                                                       |
 
+Two endpoints beyond the brief earn their keep: `GET /predictions` (summaries,
+newest first, `limit` mandatory) and `GET /stats` (pool size, pending and
+running segments). Without them, "what is the service working on, and is my
+job queued or stuck?" is only answerable by reading logs.
+
 Observability is per event: `job_accepted`, `segment_started` (with `queued_s`,
 the backpressure signal), `segment_succeeded` (with `duration_s`),
 `segment_failed` (with traceback), `job_finished`. Queue time and compute time

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Dict, List, Optional, Tuple
 from uuid import UUID, uuid4
 
@@ -28,6 +28,14 @@ from pythia_service.domain.models import (
 from pythia_service.jobs.state import derive_job_status
 
 SegmentKey = Tuple[str, str, str]  # (game, region, platform)
+
+
+@dataclass(frozen=True)
+class StoreStats:
+    jobs_total: int
+    jobs_active: int
+    segments_pending: int
+    segments_running: int
 
 
 @dataclass
@@ -90,7 +98,7 @@ class JobStore:
     def _new_job(
         request: PredictionRequest, dedup_key: str, segment_keys: List[SegmentKey]
     ) -> Job:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         return Job(
             job_id=uuid4(),
             dedup_key=dedup_key,
@@ -116,6 +124,32 @@ class JobStore:
             job = self._jobs.get(job_id)
             return self._snapshot(job) if job is not None else None
 
+    def list_jobs(self, limit: int, status: JobStatus | None = None) -> List[Job]:
+        """Newest first, snapshots. Sorting and filtering happen under the
+        lock but only `limit` jobs are copied, so the critical section grows
+        with the number of jobs, not with their segments. A persistent store
+        would push both into the query instead.
+        """
+        with self._lock:
+            jobs = self._jobs.values()
+            if status is not None:
+                jobs = [job for job in jobs if job.status == status]
+            newest = sorted(jobs, key=lambda job: job.created_at, reverse=True)[:limit]
+            return [self._snapshot(job) for job in newest]
+
+    def stats(self) -> StoreStats:
+        """Aggregate counters. O(segments) under the lock, which is fine at
+        this scale and is the first thing to move into the database.
+        """
+        with self._lock:
+            segments = [seg.status for job in self._jobs.values() for seg in job.segments.values()]
+            return StoreStats(
+                jobs_total=len(self._jobs),
+                jobs_active=len(self._active_by_dedup_key),
+                segments_pending=sum(s == SegmentStatus.PENDING for s in segments),
+                segments_running=sum(s == SegmentStatus.RUNNING for s in segments),
+            )
+
     def update_segment(self, job_id: UUID, segment_key: SegmentKey, updated: SegmentResult) -> bool:
         """Replace one segment's state, from the thread running it.
 
@@ -129,7 +163,7 @@ class JobStore:
                 return False  # defensive: job was never created or was purged
             was_terminal = job.is_terminal()
             job.segments[segment_key] = updated
-            job.updated_at = datetime.now(timezone.utc)
+            job.updated_at = datetime.now(UTC)
             if job.is_terminal():
                 # Drop the dedup slot: a later identical request deserves a
                 # fresh job, not a merge into this finished one.

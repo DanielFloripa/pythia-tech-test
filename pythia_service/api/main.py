@@ -17,6 +17,7 @@ from fastapi import FastAPI
 
 from pythia_service.api.routes.health import router as health_router
 from pythia_service.api.routes.predictions import router as predictions_router
+from pythia_service.api.routes.stats import router as stats_router
 from pythia_service.domain.models import MAX_SEGMENTS_PER_REQUEST
 from pythia_service.jobs.store import JobStore
 from pythia_service.logging_setup import configure_logging, get_logger, kv
@@ -53,4 +54,5 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(title="Pythia Prediction Service", lifespan=lifespan)
 app.include_router(health_router)
+app.include_router(stats_router)
 app.include_router(predictions_router)

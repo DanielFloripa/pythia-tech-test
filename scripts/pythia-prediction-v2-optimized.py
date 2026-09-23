@@ -24,8 +24,8 @@ from concurrent.futures import Future, ThreadPoolExecutor
 
 import pandas as pd
 
-from pythia_library_v2.modeling import fit_player_data, fit_economy_data, fit_gameround_data, predict
 from pythia_library_v2.bigquery import query_data
+from pythia_library_v2.modeling import fit_economy_data, fit_gameround_data, fit_player_data, predict
 
 # Memory sets this number, not CPU. One segment holds ~0.7 GB of model
 # arrays (0.76 GB peak RSS, measured), and segments started together peak
@@ -143,7 +143,7 @@ def main():
         # Submission order, so the CSV rows line up with v1's. A failing
         # segment aborts the run here, also like v1: unlike the service,
         # this script has no partial-failure story to tell.
-        for (game, region, platform), future in zip(segments, futures):
+        for (game, region, platform), future in zip(segments, futures, strict=True):
             total, mean = future.result()
             print(game, region, platform, total, mean)
             results.append({"game": game, "region": region, "platform": platform, "sum": total, "mean": mean})
