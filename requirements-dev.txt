@@ -1,0 +1,5 @@
+# Test-only dependencies. requirements.txt stays exactly as the challenge
+# shipped it, so the service still installs with nothing extra.
+-r requirements.txt
+pytest
+httpx    # FastAPI's TestClient transport
