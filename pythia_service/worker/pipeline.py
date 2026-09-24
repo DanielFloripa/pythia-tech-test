@@ -15,6 +15,7 @@ queued_s on segment_started is the backpressure number worth watching.
 """
 
 import time
+from concurrent.futures import Executor, Future
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -137,27 +138,40 @@ def process_segment(
         )
 
 
-def submit_job_segments(store: JobStore, pool_executor, job_id: UUID, segment_keys: list[SegmentKey]) -> None:
+def submit_job_segments(
+    store: JobStore, pool_executor: Executor, job_id: UUID, segment_keys: list[SegmentKey]
+) -> None:
     """Enqueue a job's segments. Fire and forget: the API responds right
     after this, and progress is only ever seen through GET.
     """
-    for i, segment_key in enumerate(segment_keys):
+    scheduled: list[tuple[SegmentKey, Future]] = []
+    for index, segment_key in enumerate(segment_keys):
         try:
-            pool_executor.submit(process_segment, store, job_id, segment_key, time.monotonic())
+            future = pool_executor.submit(process_segment, store, job_id, segment_key, time.monotonic())
         except RuntimeError:
-            # Pool went down mid-loop. Leaving the rest PENDING would strand
+            # The pool went down mid-loop. Anything left pending would strand
             # the job forever and, worse, keep its dedup key occupied, so
-            # every identical request afterwards would join a dead job.
-            # Deleting the job is not an option either: a deduplicated caller
-            # may already hold this id, and their next GET would 404.
+            # every identical request afterwards would join a job that can
+            # never finish. Deleting the job is not an option either: a
+            # deduplicated caller may already hold this id, and their next
+            # GET would 404.
+            #
+            # cancel() tells the two cases apart. It succeeds only for
+            # segments still waiting in the queue, which the pool's shutdown
+            # would drop anyway; segments already running keep going and
+            # write their own result.
+            cancelled = [key for key, pending in scheduled if pending.cancel()]
+            stranded = cancelled + segment_keys[index:]
             logger.warning(kv(
-                "job_schedule_failed", job_id=job_id, scheduled=i, unscheduled=len(segment_keys) - i,
+                "job_schedule_failed", job_id=job_id, stranded=len(stranded),
+                still_running=len(scheduled) - len(cancelled),
             ))
-            _fail_unscheduled(store, job_id, segment_keys[i:])
+            _fail_stranded(store, job_id, stranded)
             raise
+        scheduled.append((segment_key, future))
 
 
-def _fail_unscheduled(store: JobStore, job_id: UUID, segment_keys: list[SegmentKey]) -> None:
+def _fail_stranded(store: JobStore, job_id: UUID, segment_keys: list[SegmentKey]) -> None:
     now = datetime.now(UTC)
     for game, region, platform in segment_keys:
         _record(
