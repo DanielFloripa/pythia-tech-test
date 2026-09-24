@@ -1,3 +1,12 @@
+> **Submission** — the original challenge text is preserved below, unchanged.
+>
+> - **[SOLUTION.md](SOLUTION.md)** — how to run it, the endpoints, where each module lives
+> - **[DESIGN.md](DESIGN.md)** — the one-page design doc: components, request flow, failure modes
+>
+> Quick start: `make install-dev && make test && make run`
+
+---
+
 # Pythia — Backend Engineer Tech Test
 
 ## Context

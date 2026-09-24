@@ -11,7 +11,7 @@ LOG_LEVEL  ?= INFO
 VENV_PATH  := PATH="$(CURDIR)/$(VENV)/bin:$$PATH"
 
 .DEFAULT_GOAL := help
-.PHONY: help install run run-debug e2e e2e-quick run-v1 run-v2 run-v2-optimized clean
+.PHONY: help install install-dev test check run run-debug e2e e2e-quick run-v1 run-v2 run-v2-optimized clean
 
 help: ## List available targets
 	@grep -E '^[a-zA-Z0-9_-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
@@ -21,6 +21,14 @@ $(PY):
 
 install: $(PY) ## Create the venv (Python 3.14) and install requirements
 	$(PY) -m pip install -r requirements.txt
+
+install-dev: $(PY) ## Also install the test dependencies (pytest, httpx)
+	$(PY) -m pip install -r requirements-dev.txt
+
+test: ## Unit tests: seconds, no library calls, no server
+	$(PY) -m pytest
+
+check: test e2e ## Unit tests, then the full end-to-end run
 
 run: ## Start the API on PORT (default 8000), single worker
 	PYTHONUNBUFFERED=1 PYTHONPATH=. LOG_LEVEL=$(LOG_LEVEL) \
